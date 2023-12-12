@@ -1,13 +1,14 @@
 package kafka
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"github.com/Shopify/sarama"
-	"github.com/docker/go-connections/nat"
+	"github.com/IBM/sarama"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/testcontainers/testcontainers-go"
+	kafkacontainer "github.com/testcontainers/testcontainers-go/modules/kafka"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
@@ -25,30 +26,20 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	// Start the container as broker AND controller
-	container := testutil.Container{
-		Image:        "bitnami/kafka",
-		Hostname:     "localhost", // required to be able to resolve the name
-		ExposedPorts: []string{"9092:9092", "9093:9093"},
-		Env: map[string]string{
-			"KAFKA_CFG_NODE_ID":                        "0",
-			"KAFKA_CFG_PROCESS_ROLES":                  "controller,broker",
-			"KAFKA_CFG_LISTENERS":                      "PLAINTEXT://:9092,CONTROLLER://:9093",
-			"KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP": "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
-			"KAFKA_CFG_CONTROLLER_QUORUM_VOTERS":       "0@localhost:9093",
-			"KAFKA_CFG_CONTROLLER_LISTENER_NAMES":      "CONTROLLER",
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForListeningPort(nat.Port("9092")),
-			wait.ForLog("Kafka Server started"),
-		),
-	}
-	require.NoError(t, container.Start(), "failed to start container")
-	defer container.Terminate()
+	ctx := context.Background()
+	kafkaContainer, err := kafkacontainer.RunContainer(ctx,
+		kafkacontainer.WithClusterID("test-cluster"),
+		testcontainers.WithImage("confluentinc/confluent-local:7.5.0"),
+	)
+	require.NoError(t, err)
+	defer kafkaContainer.Terminate(ctx) //nolint:errcheck // ignored
+
+	brokers, err := kafkaContainer.Brokers(ctx)
+	require.NoError(t, err)
 
 	// Setup the plugin
 	plugin := &Kafka{
-		Brokers:      []string{container.Address + ":" + container.Ports["9092"]},
+		Brokers:      brokers,
 		Topic:        "Test",
 		Log:          testutil.Logger{},
 		producerFunc: sarama.NewSyncProducer,
@@ -166,7 +157,7 @@ func TestRoutingKey(t *testing.T) {
 				return m
 			}(),
 			check: func(t *testing.T, routingKey string) {
-				require.Equal(t, 36, len(routingKey))
+				require.Len(t, routingKey, 36)
 			},
 		},
 	}

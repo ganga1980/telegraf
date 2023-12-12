@@ -139,8 +139,8 @@ func TestGatherDetailedBucketMetrics(t *testing.T) {
 			acc.AddFields("couchbase_bucket", fields, nil)
 
 			// Ensure we gathered only one metric (the one that we configured).
-			require.Equal(t, len(acc.Metrics), 1)
-			require.Equal(t, len(acc.Metrics[0].Fields), 1)
+			require.Len(t, acc.Metrics, 1)
+			require.Len(t, acc.Metrics[0].Fields, 1)
 		})
 	}
 }
@@ -166,8 +166,8 @@ func TestGatherNodeOnly(t *testing.T) {
 	var acc testutil.Accumulator
 	require.NoError(t, cb.gatherServer(&acc, faker.URL))
 
-	require.Equal(t, 0, len(acc.Errors))
-	require.Equal(t, 7, len(acc.Metrics))
+	require.Empty(t, acc.Errors)
+	require.Len(t, acc.Metrics, 7)
 	acc.AssertDoesNotContainMeasurement(t, "couchbase_bucket")
 }
 
@@ -197,8 +197,8 @@ func TestGatherFailover(t *testing.T) {
 
 	var acc testutil.Accumulator
 	require.NoError(t, cb.gatherServer(&acc, faker.URL))
-	require.Equal(t, 0, len(acc.Errors))
-	require.Equal(t, 8, len(acc.Metrics))
+	require.Empty(t, acc.Errors)
+	require.Len(t, acc.Metrics, 8)
 
 	var metric *testutil.Metric
 	for _, m := range acc.Metrics {

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
@@ -46,6 +46,7 @@ type KafkaConsumer struct {
 	TopicRegexps           []string        `toml:"topic_regexps"`
 	TopicTag               string          `toml:"topic_tag"`
 	MsgHeadersAsTags       []string        `toml:"msg_headers_as_tags"`
+	MsgHeaderAsMetricName  string          `toml:"msg_header_as_metric_name"`
 	ConsumerFetchDefault   config.Size     `toml:"consumer_fetch_default"`
 	ConnectionStrategy     string          `toml:"connection_strategy"`
 
@@ -65,10 +66,10 @@ type KafkaConsumer struct {
 	ticker          *time.Ticker
 	fingerprint     string
 
-	parserFunc telegraf.ParserFunc
-	topicLock  sync.Mutex
-	wg         sync.WaitGroup
-	cancel     context.CancelFunc
+	parser    telegraf.Parser
+	topicLock sync.Mutex
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
 }
 
 type ConsumerGroup interface {
@@ -91,8 +92,8 @@ func (*KafkaConsumer) SampleConfig() string {
 	return sampleConfig
 }
 
-func (k *KafkaConsumer) SetParserFunc(fn telegraf.ParserFunc) {
-	k.parserFunc = fn
+func (k *KafkaConsumer) SetParser(parser telegraf.Parser) {
+	k.parser = parser
 }
 
 func (k *KafkaConsumer) Init() error {
@@ -136,11 +137,11 @@ func (k *KafkaConsumer) Init() error {
 
 	switch strings.ToLower(k.BalanceStrategy) {
 	case "range", "":
-		cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategyRange}
+		cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRange()}
 	case "roundrobin":
-		cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategyRoundRobin}
+		cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
 	case "sticky":
-		cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
+		cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategySticky()}
 	default:
 		return fmt.Errorf("invalid balance strategy %q", k.BalanceStrategy)
 	}
@@ -318,14 +319,17 @@ func (k *KafkaConsumer) Start(acc telegraf.Accumulator) error {
 		k.startErrorAdder(acc)
 
 		for ctx.Err() == nil {
-			handler := NewConsumerGroupHandler(acc, k.MaxUndeliveredMessages, k.parserFunc, k.Log)
+			handler := NewConsumerGroupHandler(acc, k.MaxUndeliveredMessages, k.parser, k.Log)
 			handler.MaxMessageLen = k.MaxMessageLen
 			handler.TopicTag = k.TopicTag
+			handler.MsgHeaderToMetricName = k.MsgHeaderAsMetricName
 			//if message headers list specified, put it as map to handler
 			msgHeadersMap := make(map[string]bool, len(k.MsgHeadersAsTags))
 			if len(k.MsgHeadersAsTags) > 0 {
 				for _, header := range k.MsgHeadersAsTags {
-					msgHeadersMap[header] = true
+					if k.MsgHeaderAsMetricName != header {
+						msgHeadersMap[header] = true
+					}
 				}
 			}
 			handler.MsgHeadersToTags = msgHeadersMap
@@ -377,12 +381,12 @@ type Message struct {
 	session sarama.ConsumerGroupSession
 }
 
-func NewConsumerGroupHandler(acc telegraf.Accumulator, maxUndelivered int, fn telegraf.ParserFunc, log telegraf.Logger) *ConsumerGroupHandler {
+func NewConsumerGroupHandler(acc telegraf.Accumulator, maxUndelivered int, parser telegraf.Parser, log telegraf.Logger) *ConsumerGroupHandler {
 	handler := &ConsumerGroupHandler{
 		acc:         acc.WithTracking(maxUndelivered),
 		sem:         make(chan empty, maxUndelivered),
 		undelivered: make(map[telegraf.TrackingID]Message, maxUndelivered),
-		parserFunc:  fn,
+		parser:      parser,
 		log:         log,
 	}
 	return handler
@@ -390,15 +394,16 @@ func NewConsumerGroupHandler(acc telegraf.Accumulator, maxUndelivered int, fn te
 
 // ConsumerGroupHandler is a sarama.ConsumerGroupHandler implementation.
 type ConsumerGroupHandler struct {
-	MaxMessageLen    int
-	TopicTag         string
-	MsgHeadersToTags map[string]bool
+	MaxMessageLen         int
+	TopicTag              string
+	MsgHeadersToTags      map[string]bool
+	MsgHeaderToMetricName string
 
-	acc        telegraf.TrackingAccumulator
-	sem        semaphore
-	parserFunc telegraf.ParserFunc
-	wg         sync.WaitGroup
-	cancel     context.CancelFunc
+	acc    telegraf.TrackingAccumulator
+	sem    semaphore
+	parser telegraf.Parser
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
 
 	mu          sync.Mutex
 	undelivered map[telegraf.TrackingID]Message
@@ -476,20 +481,15 @@ func (h *ConsumerGroupHandler) Handle(session sarama.ConsumerGroupSession, msg *
 			len(msg.Value), h.MaxMessageLen)
 	}
 
-	parser, err := h.parserFunc()
-	if err != nil {
-		return fmt.Errorf("creating parser: %w", err)
-	}
-
-	metrics, err := parser.Parse(msg.Value)
+	metrics, err := h.parser.Parse(msg.Value)
 	if err != nil {
 		h.release()
 		return err
 	}
 
-	// Check if any message header should be pass as tag
 	headerKey := ""
-	if len(h.MsgHeadersToTags) > 0 {
+	// Check if any message header should override metric name or should be pass as tag
+	if len(h.MsgHeadersToTags) > 0 || h.MsgHeaderToMetricName != "" {
 		for _, header := range msg.Headers {
 			//convert to a string as the header and value are byte arrays.
 			headerKey = string(header.Key)
@@ -497,6 +497,12 @@ func (h *ConsumerGroupHandler) Handle(session sarama.ConsumerGroupSession, msg *
 				// If message header should be pass as tag then add it to the metrics
 				for _, metric := range metrics {
 					metric.AddTag(headerKey, string(header.Value))
+				}
+			} else {
+				if h.MsgHeaderToMetricName == headerKey {
+					for _, metric := range metrics {
+						metric.SetName(string(header.Value))
+					}
 				}
 			}
 		}
